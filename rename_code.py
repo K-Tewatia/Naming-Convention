@@ -191,13 +191,15 @@ if st.session_state.pending_changes:
 # -----------------------
 @st.cache_resource
 def build_drive_service_from_secrets(_gcp_credentials):
-    """Build Drive service from secrets.toml credentials"""
+    """Build and cache Google Drive service using Streamlit secrets"""
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    
     creds = service_account.Credentials.from_service_account_info(
         _gcp_credentials,
         scopes=["https://www.googleapis.com/auth/drive.readonly"]
     )
     return build("drive", "v3", credentials=creds)
-
 
 @st.cache_data(ttl=3600)
 def find_folder_id(_drive_service, folder_name, parent_id=None):
@@ -672,4 +674,5 @@ else:
     - **No Drive changes**: All edits only affect Excel file
     - **🆕 State Persistence**: Your progress is automatically saved and restored
     - **🆕 Auto-refresh**: Page refreshes after 5 minutes of inactivity
+
     """)
