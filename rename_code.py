@@ -428,7 +428,7 @@ if credentials_file and excel_file:
     # Build drive service once
     if st.session_state.drive_service is None:
         try:
-            st.session_state.drive_service = build_drive_service(credentials_file)
+            st.session_state.drive_service = build_drive_service_from_secrets(credentials_file)
         except Exception as e:
             st.error(f"Auth error: {e}")
             st.stop()
@@ -676,3 +676,4 @@ else:
     - **🆕 Auto-refresh**: Page refreshes after 5 minutes of inactivity
 
     """)
+
