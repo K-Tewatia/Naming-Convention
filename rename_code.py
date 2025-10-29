@@ -647,6 +647,10 @@ if credentials_file and excel_file:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True
                     )
+                    
+            st.write("Uploading file:", file_path)
+            st.write("Exists:", os.path.exists(file_path))
+
             # Upload button (new)
             if st.button("⬆️ Upload Last Saved Excel to Supabase", use_container_width=True, type="secondary"):
                 last_saved = st.session_state.get("last_saved_file", None)
@@ -676,4 +680,5 @@ else:
     - **🆕 Auto-refresh**: Page refreshes after 5 minutes of inactivity
 
     """)
+
 
