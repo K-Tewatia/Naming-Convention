@@ -13,12 +13,97 @@ import hashlib
 
 from supabase import create_client, Client
 
+# -----------------------
+# Configuration from Secrets
+# -----------------------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+BUCKET_NAME = st.secrets["BUCKET_NAME"]  # e.g., "brand_excel_files"
+BRAND_FOLDER = st.secrets["BRAND_FOLDER"]  # e.g., "Aarize_Group" or "Brand_2"
+ORIGINAL_EXCEL_NAME = st.secrets.get("ORIGINAL_EXCEL_NAME", "Clients_Rename_Log.xlsx")
 
 @st.cache_resource
 def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# -----------------------
+# Supabase Storage Functions
+# -----------------------
+def download_file_from_supabase(bucket_name, file_path):
+    """Download a file from Supabase storage"""
+    try:
+        supabase = get_supabase_client()
+        file_data = supabase.storage.from_(bucket_name).download(file_path)
+        return file_data
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return None
+
+def upload_file_to_supabase(local_file_path, bucket_name, destination_path):
+    """Upload a file to Supabase storage"""
+    try:
+        supabase = get_supabase_client()
+        
+        # Read file content
+        with open(local_file_path, "rb") as f:
+            file_content = f.read()
+        
+        # Try to remove existing file first (for updates)
+        try:
+            supabase.storage.from_(bucket_name).remove([destination_path])
+            print(f"Removed existing file: {destination_path}")
+        except Exception as e:
+            print(f"No existing file to remove: {e}")
+        
+        # Upload the file
+        upload_response = supabase.storage.from_(bucket_name).upload(
+            path=destination_path,
+            file=file_content,
+            file_options={
+                "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "upsert": "true"
+            }
+        )
+        
+        return True
+    except Exception as e:
+        st.error(f"Upload error: {e}")
+        return False
+
+def get_original_excel_from_brand():
+    """Download the original Excel file from brand folder"""
+    try:
+        file_path = f"{BRAND_FOLDER}/{ORIGINAL_EXCEL_NAME}"
+        file_data = download_file_from_supabase(BUCKET_NAME, file_path)
+        
+        if file_data:
+            local_path = f"temp_original_{BRAND_FOLDER}_{ORIGINAL_EXCEL_NAME}"
+            with open(local_path, "wb") as f:
+                f.write(file_data)
+            return local_path
+        else:
+            st.error(f"❌ Could not find Excel file at: {file_path}")
+            return None
+    except Exception as e:
+        st.error(f"Could not load original Excel: {e}")
+        return None
+
+def get_updated_excel_from_brand():
+    """Download the updated Excel file from brand folder if it exists"""
+    try:
+        updated_filename = f"{ORIGINAL_EXCEL_NAME.replace('.xlsx', '')}_updated.xlsx"
+        file_path = f"{BRAND_FOLDER}/{updated_filename}"
+        file_data = download_file_from_supabase(BUCKET_NAME, file_path)
+        
+        if file_data:
+            local_path = f"temp_updated_{BRAND_FOLDER}_{updated_filename}"
+            with open(local_path, "wb") as f:
+                f.write(file_data)
+            return local_path
+        return None
+    except Exception as e:
+        print(f"No updated Excel found (normal for first run): {e}")
+        return None
 
 # -----------------------
 # State Persistence Functions
@@ -26,12 +111,10 @@ def get_supabase_client() -> Client:
 def get_user_id():
     """Generate a persistent user ID based on browser"""
     if "user_id" not in st.session_state:
-        # Try to get from query params first (for persistence across refreshes)
         query_params = st.query_params
         if "user_id" in query_params:
             st.session_state.user_id = query_params["user_id"]
         else:
-            # Create a new unique ID and set it in query params
             from streamlit.runtime.scriptrunner import get_script_run_ctx
             session_id = get_script_run_ctx().session_id
             new_user_id = hashlib.md5(session_id.encode()).hexdigest()
@@ -47,32 +130,31 @@ def save_state_to_supabase():
         
         state_data = {
             "user_id": user_id,
+            "brand": BRAND_FOLDER,
             "pending_changes": st.session_state.pending_changes,
             "index": st.session_state.index,
             "last_updated": datetime.now().isoformat(),
-            "excel_filename": st.session_state.get("uploaded_excel_name", None)
+            "total_saves": st.session_state.get("total_saves", 0)
         }
         
-        # Check if record exists
-        existing = supabase.table("user_states").select("id").eq("user_id", user_id).execute()
+        # Use brand-specific state tracking
+        state_key = f"{user_id}_{BRAND_FOLDER}"
+        existing = supabase.table("user_states").select("id").eq("user_id", state_key).execute()
         
         if existing.data and len(existing.data) > 0:
-            # Update existing record
             supabase.table("user_states").update({
                 "state_data": json.dumps(state_data),
                 "last_updated": datetime.now().isoformat()
-            }).eq("user_id", user_id).execute()
+            }).eq("user_id", state_key).execute()
         else:
-            # Insert new record
             supabase.table("user_states").insert({
-                "user_id": user_id,
+                "user_id": state_key,
                 "state_data": json.dumps(state_data),
                 "last_updated": datetime.now().isoformat()
             }).execute()
         
         return True
     except Exception as e:
-        # Silently log errors to avoid disrupting user experience
         print(f"Failed to save state: {e}")
         return False
 
@@ -81,16 +163,16 @@ def load_state_from_supabase():
     try:
         supabase = get_supabase_client()
         user_id = get_user_id()
+        state_key = f"{user_id}_{BRAND_FOLDER}"
         
-        response = supabase.table("user_states").select("*").eq("user_id", user_id).execute()
+        response = supabase.table("user_states").select("*").eq("user_id", state_key).execute()
         
         if response.data and len(response.data) > 0:
             state_data = json.loads(response.data[0]["state_data"])
             
-            # Restore state
             st.session_state.pending_changes = state_data.get("pending_changes", {})
             st.session_state.index = state_data.get("index", 0)
-            st.session_state.uploaded_excel_name = state_data.get("excel_filename", None)
+            st.session_state.total_saves = state_data.get("total_saves", 0)
             
             return True
         return False
@@ -103,7 +185,7 @@ def auto_refresh_script():
     return """
     <script>
     let inactivityTimer;
-    const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
+    const INACTIVITY_TIMEOUT = 5 * 60 * 1000;
     
     function resetTimer() {
         clearTimeout(inactivityTimer);
@@ -112,25 +194,21 @@ def auto_refresh_script():
         }, INACTIVITY_TIMEOUT);
     }
     
-    // Reset timer on any user activity
     ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart', 'click'].forEach(event => {
         document.addEventListener(event, resetTimer, true);
     });
     
-    // Initialize timer
     resetTimer();
     </script>
     """
 
 # -----------------------
-# Page Config and Auto-refresh
+# Page Config
 # -----------------------
-st.set_page_config(page_title="📂 File Rename Validator", layout="wide")
-
-# Inject auto-refresh script
+st.set_page_config(page_title=f"📂 File Rename Validator - {BRAND_FOLDER}", layout="wide")
 st.components.v1.html(auto_refresh_script(), height=0)
 
-st.title("📂 File Rename Validator")
+st.title(f"📂 File Rename Validator - {BRAND_FOLDER}")
 
 # -----------------------
 # Initialize session state
@@ -151,40 +229,42 @@ if "state_loaded" not in st.session_state:
     st.session_state.state_loaded = False
 if "last_save_time" not in st.session_state:
     st.session_state.last_save_time = time.time()
+if "total_saves" not in st.session_state:
+    st.session_state.total_saves = 0
+if "working_excel_path" not in st.session_state:
+    st.session_state.working_excel_path = None
+if "excel_loaded" not in st.session_state:
+    st.session_state.excel_loaded = False
 
 # Load previous state on first run
 if not st.session_state.state_loaded:
     if load_state_from_supabase():
         st.session_state.state_loaded = True
-        # Show restoration message
-        if st.session_state.pending_changes:
-            st.sidebar.success(f"🔄 Restored {len(st.session_state.pending_changes)} pending changes")
+        if st.session_state.pending_changes or st.session_state.index > 0:
+            st.sidebar.success(f"🔄 Restored: File {st.session_state.index + 1}, {len(st.session_state.pending_changes)} changes")
     else:
         st.session_state.state_loaded = True
 
-# Auto-save state periodically (every 30 seconds if there are changes)
+# Auto-save state periodically
 current_time = time.time()
 if current_time - st.session_state.last_save_time > 30:
-    if st.session_state.pending_changes:
+    if st.session_state.pending_changes or st.session_state.index > 0:
         save_state_to_supabase()
     st.session_state.last_save_time = current_time
 
 # -----------------------
-# Sidebar uploads
+# Sidebar Info
 # -----------------------
-st.sidebar.header("📁 Upload Files")
-credentials_file = st.secrets["gcp_service_account"]
+st.sidebar.header("🏢 Brand Information")
+st.sidebar.info(f"**Brand:** {BRAND_FOLDER}")
+st.sidebar.info(f"**Excel:** {ORIGINAL_EXCEL_NAME}")
 
-excel_file = st.sidebar.file_uploader("Upload Excel File", type=["xlsx"])
-
-# Store uploaded Excel filename
-if excel_file and "uploaded_excel_name" not in st.session_state:
-    st.session_state.uploaded_excel_name = excel_file.name
-
-# Show pending changes info in sidebar
 if st.session_state.pending_changes:
     st.sidebar.markdown("---")
-    st.sidebar.info(f"💾 {len(st.session_state.pending_changes)} pending changes (auto-saved)")
+    st.sidebar.info(f"💾 {len(st.session_state.pending_changes)} pending changes")
+
+if st.session_state.total_saves > 0:
+    st.sidebar.info(f"📊 Total saves: {st.session_state.total_saves}")
 
 # -----------------------
 # Helper functions with caching
@@ -192,9 +272,6 @@ if st.session_state.pending_changes:
 @st.cache_resource
 def build_drive_service_from_secrets(_gcp_credentials):
     """Build and cache Google Drive service using Streamlit secrets"""
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    
     creds = service_account.Credentials.from_service_account_info(
         _gcp_credentials,
         scopes=["https://www.googleapis.com/auth/drive.readonly"]
@@ -359,89 +436,118 @@ def get_file_from_drive(drive_service, row, file_cache):
         except Exception:
             pass
     
-    # Always return 5 values (file_meta, tmp_path, mime, actual_name, web_view_link)
     result = (file_meta, tmp_path, mime, actual_name, web_view_link)
     file_cache[cache_key] = result
     return result
 
-def save_pending_changes_to_excel(df, pending_changes, excel_filename="Updated_Clients_Rename_Log.xlsx"):
+def get_working_excel_path():
+    """Get the current working Excel file path"""
+    # Try to download updated Excel from Supabase first
+    if st.session_state.total_saves > 0:
+        downloaded_path = get_updated_excel_from_brand()
+        if downloaded_path and os.path.exists(downloaded_path):
+            return downloaded_path
     
-    # Apply pending name changes
-    for full_path, new_name in pending_changes.items():
-        mask = df["Full Path"] == full_path
-        if mask.sum() == 0:
-            mask = df["Original Name"] == full_path
-        df.loc[mask, "Proposed New Name"] = new_name
+    # Otherwise, return the working path if it exists
+    if st.session_state.working_excel_path and os.path.exists(st.session_state.working_excel_path):
+        return st.session_state.working_excel_path
+    
+    return None
 
-    # Save the changes to the **existing** Excel file
-    df.to_excel(excel_filename, index=False)
-
-    # Store the last saved filename for later upload
-    st.session_state["last_saved_file"] = excel_filename
-
-    # Save state after saving Excel
-    save_state_to_supabase()
-
-    st.success(f"✅ Changes saved to the existing file: {excel_filename}")
-    return excel_filename
-
-def upload_to_supabase(file_path, bucket_name="renamed_excel"):
-    """Uploads file to Supabase storage, replacing if already exists"""
+def save_pending_changes_to_excel(df, pending_changes):
+    """Save pending changes to Excel, building on previous saves"""
     try:
-        supabase = get_supabase_client()
-        file_name = os.path.basename(file_path)
-
-        # Try to remove existing file first
-        try:
-            remove_response = supabase.storage.from_(bucket_name).remove([file_name])
-            st.info(f"🔄 Removed existing file: {file_name}")
-        except Exception as remove_error:
-            # File might not exist, which is fine
-            print(f"Remove attempt: {remove_error}")
-
-        # Upload the file
-        with open(file_path, "rb") as f:
-            file_content = f.read()
-            
-        upload_response = supabase.storage.from_(bucket_name).upload(
-            path=file_name,
-            file=file_content,
-            file_options={
-                "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "upsert": "true"
-            }
-        )
+        # Get the current working Excel path
+        working_path = get_working_excel_path()
         
-        st.success(f"📤 File successfully uploaded to Supabase: {file_name}")
-        return True
-
+        # If we have a working path, load it to get all previous changes
+        if working_path:
+            df = pd.read_excel(working_path)
+        
+        # Apply pending name changes to the DataFrame
+        for full_path, new_name in pending_changes.items():
+            mask = df["Full Path"] == full_path
+            if mask.sum() == 0:
+                mask = df["Original Name"] == full_path
+            df.loc[mask, "Proposed New Name"] = new_name
+        
+        # Create output filename
+        updated_filename = f"{ORIGINAL_EXCEL_NAME.replace('.xlsx', '')}_updated.xlsx"
+        local_output_path = f"temp_{BRAND_FOLDER}_{updated_filename}"
+        
+        # Save to local file
+        df.to_excel(local_output_path, index=False)
+        
+        # Upload to Supabase in the brand folder
+        supabase_path = f"{BRAND_FOLDER}/{updated_filename}"
+        upload_success = upload_file_to_supabase(local_output_path, BUCKET_NAME, supabase_path)
+        
+        if upload_success:
+            # Update working path
+            st.session_state.working_excel_path = local_output_path
+            
+            # Increment save counter
+            st.session_state.total_saves += 1
+            
+            # Save state
+            save_state_to_supabase()
+            
+            return local_output_path
+        else:
+            st.error("Failed to upload to Supabase")
+            return None
     except Exception as e:
-        st.error(f"⚠️ Upload to Supabase failed: {str(e)}")
-        # Show more details for debugging
-        st.error(f"Details: {type(e).__name__}")
-        return False
+        st.error(f"Error saving Excel: {e}")
+        return None
 
 # -----------------------
 # Main app logic
 # -----------------------
-if credentials_file and excel_file:
-    # Build drive service once
-    if st.session_state.drive_service is None:
-        try:
-            st.session_state.drive_service = build_drive_service_from_secrets(credentials_file)
-        except Exception as e:
-            st.error(f"Auth error: {e}")
-            st.stop()
-    
-    drive_service = st.session_state.drive_service
-    
-    # Load Excel once
-    if st.session_state.df is None:
-        df = pd.read_excel(excel_file)
+
+# Build drive service
+credentials_file = st.secrets["gcp_service_account"]
+
+if st.session_state.drive_service is None:
+    try:
+        st.session_state.drive_service = build_drive_service_from_secrets(credentials_file)
+    except Exception as e:
+        st.error(f"Auth error: {e}")
+        st.stop()
+
+drive_service = st.session_state.drive_service
+
+# Load Excel automatically from Supabase
+if st.session_state.df is None and not st.session_state.excel_loaded:
+    with st.spinner(f"📥 Loading Excel from Supabase ({BRAND_FOLDER})..."):
+        # Try to get working Excel first (if previous saves exist)
+        working_path = get_working_excel_path()
+        
+        if working_path:
+            df = pd.read_excel(working_path)
+            st.sidebar.success("✅ Loaded previous working file")
+        else:
+            # Load original Excel from Supabase
+            original_path = get_original_excel_from_brand()
+            if not original_path:
+                st.error(f"❌ Could not load Excel file from Supabase folder: {BRAND_FOLDER}")
+                st.stop()
+            
+            df = pd.read_excel(original_path)
+            st.sidebar.success("✅ Loaded original Excel")
+            
+            # Save as initial working copy
+            updated_filename = f"{ORIGINAL_EXCEL_NAME.replace('.xlsx', '')}_updated.xlsx"
+            initial_working_path = f"temp_{BRAND_FOLDER}_{updated_filename}"
+            df.to_excel(initial_working_path, index=False)
+            st.session_state.working_excel_path = initial_working_path
+        
+        st.session_state.excel_loaded = True
+        
+        # Validate required columns
         required_cols = ["Type", "Original Name", "Proposed New Name", "Full Path", "Created Date", "Timestamp", "Action"]
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            st.error(f"Missing columns: {missing}")
+            st.error(f"Missing required columns: {missing}")
             st.stop()
         
         # Find invalid rows
@@ -453,232 +559,216 @@ if credentials_file and excel_file:
         
         st.session_state.df = df
         st.session_state.invalid_rows = invalid_rows
+
+df = st.session_state.df
+invalid_rows = st.session_state.invalid_rows
+
+# Display metrics
+col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+with col_m1:
+    st.metric("Total Files", len(df))
+with col_m2:
+    st.metric("Files Flagged", len(invalid_rows))
+with col_m3:
+    st.metric("Pending Changes", len(st.session_state.pending_changes))
+with col_m4:
+    st.metric("Current Position", f"{st.session_state.index + 1}/{len(invalid_rows)}")
+
+if len(invalid_rows) == 0:
+    st.success("✅ All proposed names look good!")
+    st.balloons()
+    st.stop()
+
+# Ensure index is within bounds
+if st.session_state.index >= len(invalid_rows):
+    st.session_state.index = len(invalid_rows) - 1
+if st.session_state.index < 0:
+    st.session_state.index = 0
+
+# Navigation
+col_nav1, col_nav2, col_nav3 = st.columns([1, 6, 1])
+with col_nav1:
+    if st.button("⬅️ Previous") and st.session_state.index > 0:
+        st.session_state.index -= 1
+        save_state_to_supabase()
+        st.rerun()
+with col_nav3:
+    if st.button("Next ➡️") and st.session_state.index < len(invalid_rows) - 1:
+        st.session_state.index += 1
+        save_state_to_supabase()
+        st.rerun()
+
+st.markdown(f"### File {st.session_state.index + 1} of {len(invalid_rows)}")
+st.progress((st.session_state.index + 1) / len(invalid_rows))
+
+row = invalid_rows.iloc[st.session_state.index]
+
+# Pre-fetch file info for Drive link
+with st.spinner("Loading file info..."):
+    file_meta, tmp_path, mime, actual_name, web_view_link = get_file_from_drive(
+        drive_service, row, st.session_state.file_cache
+    )
+
+# -----------------------
+# THREE COLUMN LAYOUT
+# -----------------------
+col_left, col_middle, col_right = st.columns([2, 3, 3])
+
+# LEFT: Original Name Info + View in Drive Button
+with col_left:
+    st.markdown("#### 📄 Current File Info")
+    st.text_input("Original Name", value=row['Original Name'], disabled=True)
+    st.text_input("Current Proposed", value=row['Proposed New Name'], disabled=True)
+    st.text_area("Full Path", value=row['Full Path'], height=100, disabled=True)
+    st.text_input("Created Date", value=str(row.get('Created Date', '')), disabled=True)
     
-    df = st.session_state.df
-    invalid_rows = st.session_state.invalid_rows
+    # Show if this file has pending changes
+    cache_key = row['Full Path']
+    if cache_key in st.session_state.pending_changes:
+        st.info(f"✏️ **Pending:** {st.session_state.pending_changes[cache_key]}")
     
-    # Display metrics
-    col_m1, col_m2, col_m3 = st.columns(3)
-    with col_m1:
-        st.metric("Total Files", len(df))
-    with col_m2:
-        st.metric("Files Flagged", len(invalid_rows))
-    with col_m3:
-        st.metric("Pending Changes", len(st.session_state.pending_changes))
-    
-    if len(invalid_rows) == 0:
-        st.success("✅ All proposed names look good!")
-        st.stop()
-    
-    # Navigation
-    col_nav1, col_nav2, col_nav3 = st.columns([1, 6, 1])
-    with col_nav1:
-        if st.button("⬅️ Previous") and st.session_state.index > 0:
-            st.session_state.index -= 1
-            save_state_to_supabase()
-            st.rerun()
-    with col_nav3:
-        if st.button("Next ➡️") and st.session_state.index < len(invalid_rows) - 1:
-            st.session_state.index += 1
-            save_state_to_supabase()
-            st.rerun()
-    
-    st.markdown(f"### File {st.session_state.index + 1} of {len(invalid_rows)}")
-    st.progress((st.session_state.index + 1) / len(invalid_rows))
-    
-    row = invalid_rows.iloc[st.session_state.index]
-    
-    # Pre-fetch file info for Drive link
-    with st.spinner("Loading file info..."):
-        file_meta, tmp_path, mime, actual_name, web_view_link = get_file_from_drive(
-            drive_service, row, st.session_state.file_cache
-        )
-    
-    # -----------------------
-    # THREE COLUMN LAYOUT
-    # -----------------------
-    col_left, col_middle, col_right = st.columns([2, 3, 3])
-    
-    # LEFT: Original Name Info + View in Drive Button
-    with col_left:
-        st.markdown("#### 📄 Current File Info")
-        st.text_input("Original Name", value=row['Original Name'], disabled=True)
-        st.text_input("Current Proposed", value=row['Proposed New Name'], disabled=True)
-        st.text_area("Full Path", value=row['Full Path'], height=100, disabled=True)
-        st.text_input("Created Date", value=str(row.get('Created Date', '')), disabled=True)
-        
-        # Show if this file has pending changes
-        cache_key = row['Full Path']
-        if cache_key in st.session_state.pending_changes:
-            st.info(f"✏️ **Pending:** {st.session_state.pending_changes[cache_key]}")
-        
-        # View in Drive button
-        st.markdown("---")
-        if web_view_link:
-            st.link_button(
-                "🔗 View in Google Drive",
-                web_view_link,
-                use_container_width=True,
-                type="primary"
-            )
-        else:
-            st.warning("⚠️ Drive link not available")
-    
-    # MIDDLE: Edit Interface
-    with col_middle:
-        st.markdown("#### ✏️ Edit Default Fields")
-        
-        current_name = st.session_state.pending_changes.get(row['Full Path'], str(row["Proposed New Name"]))
-        parts = current_name.split("_")
-        while len(parts) < 7:
-            parts.append("")
-        
-        fields = ["Brand", "Campaign", "Channel", "Asset", "Format", "Version", "Date"]
-        edited_parts = []
-        
-        for i, field in enumerate(fields):
-            current = parts[i] if i < len(parts) else ""
-            if current.strip().lower() == field.lower():
-                val = st.text_input(f"{field} ⚠️ (needs update)", value=current, key=f"field_{i}_{st.session_state.index}")
-                edited_parts.append(val)
-            else:
-                st.text_input(f"{field}", value=current, disabled=True, key=f"field_locked_{i}_{st.session_state.index}")
-                edited_parts.append(current)
-        
-        new_proposed = "_".join(edited_parts)
-        st.markdown("**Preview:**")
-        st.code(new_proposed, language=None)
-        
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("💾 Save Change", use_container_width=True):
-                st.session_state.pending_changes[row['Full Path']] = new_proposed
-                save_state_to_supabase()
-                st.success("✅ Change saved to batch!")
-                st.rerun()
-        
-        with col_btn2:
-            if st.button("🔄 Reset", use_container_width=True):
-                if row['Full Path'] in st.session_state.pending_changes:
-                    del st.session_state.pending_changes[row['Full Path']]
-                save_state_to_supabase()
-                st.rerun()
-        
-        # Auto-save every 10 files
-        if len(st.session_state.pending_changes) >= 10:
-            st.warning(f"⚠️ {len(st.session_state.pending_changes)} changes pending - save recommended!")
-            if st.button("💾 Save Batch to Excel Now", use_container_width=True, type="primary"):
-                out_fname = save_pending_changes_to_excel(df, st.session_state.pending_changes)
-                num_changes = len(st.session_state.pending_changes)
-                st.session_state.pending_changes.clear()
-                save_state_to_supabase()
-                st.success(f"✅ {num_changes} changes saved to {out_fname}")
-                with open(out_fname, "rb") as f:
-                    st.download_button(
-                        "📥 Download Updated Excel",
-                        data=f,
-                        file_name=out_fname,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                st.rerun()
-    
-    # RIGHT: File Preview
-    with col_right:
-        st.markdown("#### 👀 File Preview")
-        
-        if file_meta and tmp_path:
-            try:
-                if mime and mime.startswith("image/"):
-                    st.image(tmp_path, use_container_width=True)
-                elif mime and mime.startswith("video/"):
-                    st.video(tmp_path)
-                elif mime and mime.startswith("audio/"):
-                    st.audio(tmp_path)
-                elif mime == "application/pdf":
-                    with open(tmp_path, "rb") as f:
-                        pdf_bytes = f.read()
-                    st.download_button(
-                        "📄 Open PDF",
-                        data=pdf_bytes,
-                        file_name=actual_name,
-                        use_container_width=True
-                    )
-                else:
-                    with open(tmp_path, "rb") as f:
-                        file_bytes = f.read()
-                    st.download_button(
-                        "📥 Download File",
-                        data=file_bytes,
-                        file_name=actual_name,
-                        use_container_width=True
-                    )
-            except Exception as e:
-                st.error(f"Preview error: {e}")
-        else:
-            st.warning("⚠️ File not found in Drive")
-    
-    # -----------------------
-    # Bottom: Batch Actions
-    # -----------------------
+    # View in Drive button
     st.markdown("---")
-    st.markdown("### 📊 Pending Changes Summary")
+    if web_view_link:
+        st.link_button(
+            "🔗 View in Google Drive",
+            web_view_link,
+            use_container_width=True,
+            type="primary"
+        )
+    else:
+        st.warning("⚠️ Drive link not available")
+
+# MIDDLE: Edit Interface
+with col_middle:
+    st.markdown("#### ✏️ Edit Default Fields")
     
-    if st.session_state.pending_changes:
-        changes_df = pd.DataFrame([
-            {"Original Path": k, "New Name": v}
-            for k, v in st.session_state.pending_changes.items()
-        ])
-        st.dataframe(changes_df, use_container_width=True)
-        
-        col_action1, col_action2 = st.columns(2)
-        with col_action1:
-            if st.button("💾 Save All to Excel", use_container_width=True, type="primary"):
-                out_fname = save_pending_changes_to_excel(df, st.session_state.pending_changes)
+    current_name = st.session_state.pending_changes.get(row['Full Path'], str(row["Proposed New Name"]))
+    parts = current_name.split("_")
+    while len(parts) < 7:
+        parts.append("")
+    
+    fields = ["Brand", "Campaign", "Channel", "Asset", "Format", "Version", "Date"]
+    edited_parts = []
+    
+    for i, field in enumerate(fields):
+        current = parts[i] if i < len(parts) else ""
+        if current.strip().lower() == field.lower():
+            val = st.text_input(f"{field} ⚠️ (needs update)", value=current, key=f"field_{i}_{st.session_state.index}")
+            edited_parts.append(val)
+        else:
+            st.text_input(f"{field}", value=current, disabled=True, key=f"field_locked_{i}_{st.session_state.index}")
+            edited_parts.append(current)
+    
+    new_proposed = "_".join(edited_parts)
+    st.markdown("**Preview:**")
+    st.code(new_proposed, language=None)
+    
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("💾 Save Change", use_container_width=True):
+            st.session_state.pending_changes[row['Full Path']] = new_proposed
+            save_state_to_supabase()
+            st.success("✅ Change saved to batch!")
+            st.rerun()
+    
+    with col_btn2:
+        if st.button("🔄 Reset", use_container_width=True):
+            if row['Full Path'] in st.session_state.pending_changes:
+                del st.session_state.pending_changes[row['Full Path']]
+            save_state_to_supabase()
+            st.rerun()
+    
+    # Auto-save warning every 10 files
+    if len(st.session_state.pending_changes) >= 10:
+        st.warning(f"⚠️ {len(st.session_state.pending_changes)} changes pending - save recommended!")
+        if st.button("💾 Save Batch Now", use_container_width=True, type="primary"):
+            out_fname = save_pending_changes_to_excel(df, st.session_state.pending_changes)
+            if out_fname:
                 num_changes = len(st.session_state.pending_changes)
                 st.session_state.pending_changes.clear()
                 save_state_to_supabase()
-                st.success(f"✅ All {num_changes} changes saved to {out_fname}")
+                st.success(f"✅ {num_changes} changes saved & uploaded to Supabase!")
                 with open(out_fname, "rb") as f:
                     st.download_button(
                         "📥 Download Updated Excel",
                         data=f,
-                        file_name=out_fname,
+                        file_name=os.path.basename(out_fname),
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True
                     )
-            # Upload button (new)
-            if st.button("⬆️ Upload Last Saved Excel to Supabase", use_container_width=True, type="secondary"):
-                last_saved = st.session_state.get("last_saved_file", None)
-                st.write("Last saved file path:", last_saved)
-                st.write("Exists on disk:", os.path.exists(last_saved))
+                st.rerun()
 
-                if last_saved and os.path.exists(last_saved):
-                    upload_to_supabase(last_saved)
-                else:
-                    st.warning("⚠️ Please save an Excel file first before uploading.")
+# RIGHT: File Preview
+with col_right:
+    st.markdown("#### 👀 File Preview")
+    
+    if file_meta and tmp_path:
+        try:
+            if mime and mime.startswith("image/"):
+                st.image(tmp_path, use_container_width=True)
+            elif mime and mime.startswith("video/"):
+                st.video(tmp_path)
+            elif mime and mime.startswith("audio/"):
+                st.audio(tmp_path)
+            elif mime == "application/pdf":
+                with open(tmp_path, "rb") as f:
+                    pdf_bytes = f.read()
+                st.download_button(
+                    "📄 Open PDF",
+                    data=pdf_bytes,
+                    file_name=actual_name,
+                    use_container_width=True
+                )
+            else:
+                with open(tmp_path, "rb") as f:
+                    file_bytes = f.read()
+                st.download_button(
+                    "📥 Download File",
+                    data=file_bytes,
+                    file_name=actual_name,
+                    use_container_width=True
+                )
+        except Exception as e:
+            st.error(f"Preview error: {e}")
+    else:
+        st.warning("⚠️ File not found in Drive")
 
-        with col_action2:
-            if st.button("🗑️ Clear All Pending", use_container_width=True):
+# -----------------------
+# Bottom: Batch Actions
+# -----------------------
+st.markdown("---")
+st.markdown("### 📊 Pending Changes Summary")
+
+if st.session_state.pending_changes:
+    changes_df = pd.DataFrame([
+        {"Original Path": k, "New Name": v}
+        for k, v in st.session_state.pending_changes.items()
+    ])
+    st.dataframe(changes_df, use_container_width=True)
+    
+    col_action1, col_action2 = st.columns(2)
+    with col_action1:
+        if st.button("💾 Save All & Upload to Supabase", use_container_width=True, type="primary"):
+            out_fname = save_pending_changes_to_excel(df, st.session_state.pending_changes)
+            if out_fname:
+                num_changes = len(st.session_state.pending_changes)
                 st.session_state.pending_changes.clear()
                 save_state_to_supabase()
-                st.rerun()
-    else:
-        st.info("No pending changes. Make edits and click 'Save Change' to queue them.")
+                st.success(f"✅ All {num_changes} changes saved & uploaded to Supabase!")
+                with open(out_fname, "rb") as f:
+                    st.download_button(
+                        "📥 Download Updated Excel",
+                        data=f,
+                        file_name=os.path.basename(out_fname),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+    
+    with col_action2:
+        if st.button("🗑️ Clear All Pending", use_container_width=True):
+            st.session_state.pending_changes.clear()
+            save_state_to_supabase()
+            st.rerun()
 else:
-    st.info("⬅️ Upload both Service Account JSON and Excel file to begin")
-    st.markdown("""
-    ### Features:
-    - **3-column layout**: Original info | Edit interface | File preview
-    - **View in Drive button**: Direct link to open file in Google Drive
-    - **Batch saving**: Changes saved to Excel every 10 files or manually
-    - **Performance**: Caching for API calls and file downloads
-    - **Smart tracking**: See pending changes before committing
-    - **No Drive changes**: All edits only affect Excel file
-    - **🆕 State Persistence**: Your progress is automatically saved and restored
-    - **🆕 Auto-refresh**: Page refreshes after 5 minutes of inactivity
-
-    """)
-
-
-
+    st.info("No pending changes. Make edits and click 'Save Change' to queue them.")
